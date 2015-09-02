@@ -1,0 +1,399 @@
+<?php
+
+/**
+ * @file
+ * Allow anonymous users to login and register via the node/add page.
+ */
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function inline_login_form_node_type_form_alter(&$form, &$form_state, $form_id) {
+  if (module_exists('autoassignrole') && variable_get('autoassignrole_user_active', 0)) {
+    // Get a list of valid roles that can be selected.
+    $roles = array_intersect_key(user_roles(TRUE), array_filter(variable_get('autoassignrole_user_roles', array())));
+
+    if ($roles) {
+      $form['autoassignrole_user'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('User role'),
+        '#description' => t('Automatically set selected role on user registration from this content type node create page.'),
+        '#collapsible' => FALSE,
+        '#collapsed' => FALSE,
+        '#weight' => 21,
+        '#group' => 'additional_settings',
+      );
+
+      // Sort the roles.
+      if (variable_get('autoassignrole_user_sort', 'SORT_ASC') == 'SORT_ASC') {
+        asort($roles);
+      }
+      elseif (variable_get('autoassignrole_user_sort', 'SORT_DESC') == 'SORT_DESC') {
+        arsort($roles);
+      }
+      else {
+        drupal_sort_weight($roles, $roles);
+      }
+
+      $multiple = variable_get('autoassignrole_user_multiple', 0);
+      $user_selection = variable_get('autoassignrole_user_selection', AUTOASSIGNROLE_ELEMENT_RADIO_CHECKBOX);
+
+      $type = 'select';
+      if ($user_selection == AUTOASSIGNROLE_ELEMENT_RADIO_CHECKBOX) {
+        $type = $user_selection == AUTOASSIGNROLE_ELEMENT_RADIO_CHECKBOX && !$multiple ? 'radios' : 'checkboxes';
+      }
+
+      // If not multiple + not required + select box, need a none selection.
+      if (!$multiple) {
+        $roles = array(0 => t('None')) + $roles;
+      }
+
+      // Set the user description filter format.
+      $autoassignrole_user_description = _autoassignrole_get_user_description();
+
+      // Add in the element.
+      $form['autoassignrole_user']['inline_login_user_roles'] = array(
+        '#type' => $type,
+        '#title' => filter_xss(variable_get('autoassignrole_user_title', t('Role'))),
+        '#options' => $roles,
+        '#description' => filter_xss_admin($autoassignrole_user_description['value']),
+        '#multiple' => $multiple,
+        '#default_value' => variable_get('custom_techgarden_user_roles_' . $form['#node_type']->type, 0),
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function inline_login_form_node_form_alter(&$form, &$form_state, $form_id) {
+  if (user_is_anonymous() && isset($form['#node']) && variable_get('inline_registration_' . $form['#node']->type, 0)) {
+    $form['contacts'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Your contacts'),
+      '#weight' => variable_get('inline_registration_weight_' . $form['#node']->type, 0),
+    );
+    $form['contacts']['login_or_register'] = array(
+      '#type' => 'checkbox',
+      '#theme_wrappers' => array('form_element_login_register_action'),
+      '#title' => t('Login'),
+      '#weight' => 50,
+      '#description' => t('Not registered?'),
+      '#attributes' => array(
+        'data-unchecked-description' => t('Not registered?'),
+        'data-checked-description' => t('Already registered?'),
+        'data-unchecked-title' => t('Login'),
+        'data-checked-title' => t('Register'),
+      ),
+      '#states' => array(
+        'title' => array(
+          ':input[name="login_or_register"]' => array('checked' => TRUE),
+        ),
+      ),
+    );
+
+    $login_form = array(
+      '#type' => 'fieldset',
+      '#title' => t('Login'),
+      '#tree' => TRUE,
+      '#parents' => array('login'),
+      '#after_build' => array('inline_login_clean_up_form'),
+      '#states' => array(
+        'visible' => array(
+          ':input[name="login_or_register"]' => array('checked' => FALSE),
+        ),
+      ),
+    );
+    $login_form_id = 'user_login';
+    $orig_login_form = drupal_retrieve_form($login_form_id, $form_state);
+    $hooks = array('form', 'form_' . $login_form_id);
+    drupal_alter($hooks, $orig_login_form, $form_state, $login_form_id);
+    $orig_login_form['actions']['#access'] = FALSE;
+    $orig_login_form['remember_me']['#access'] = FALSE;
+    $form['contacts']['login'] = drupal_array_merge_deep($login_form, $orig_login_form);
+
+    // Set default role for content type creating form.
+    $register_form = $form['register']['form'];
+    unset($register_form['picture'], $register_form['actions']);
+    if (module_exists('autoassignrole')) {
+      $register_form['autoassignrole_user']['#access'] = FALSE;
+      $register_form['autoassignrole_user']['#parents'] = array('register');
+      $rid = variable_get('inline_login_user_roles_' . $form['#node']->type, 0);
+      $custom_role = user_role_load($rid);
+      if ($custom_role !== FALSE) {
+        $register_form['autoassignrole_user']['user_roles']['#default_value'] = $custom_role->rid;
+      }
+      else {
+        watchdog('inline_login', 'Set user role for content type %type', array('%type' => $form['#node']->type), WATCHDOG_WARNING);
+      }
+    }
+    $form['register'] = array(
+      '#type' => 'fieldset',
+      '#tree' => TRUE,
+      '#title' => t('Register'),
+      '#parents' => array('register'),
+      '#after_build' => array('inline_login_clean_up_form'),
+      '#states' => array(
+        'visible' => array(
+          ':input[name="login_or_register"]' => array('checked' => TRUE),
+        ),
+      ),
+    );
+    $form['contacts']['register'] = drupal_array_merge_deep($form['register'], $register_form);
+    unset($form['register']);
+
+    // Replace inline_registration validate/submit callbacks with self.
+    $form['#validate'][] = 'inline_login_validate';
+    if (in_array('inline_registration_validate', $form['#validate'])) {
+      unset($form['#validate'][array_search('inline_registration_validate', $form['#validate'])]);
+    }
+
+    // Remove inline_registration form submit.
+    if (is_array($form['#submit']) && in_array('inline_registration_submit', $form['#submit'])) {
+      unset($form['#submit'][array_search('inline_registration_submit', $form['#submit'])]);
+    }
+    // And ensure our submit function is called first
+    // (so the node is authored by the newly created user).
+    array_unshift($form['actions']['submit']['#submit'], 'inline_login_submit');
+  }
+}
+
+/**
+ * Clean up login/register sub-forms.
+ *
+ * @param $form
+ * @param $form_state
+ */
+function inline_login_clean_up_form($form, &$form_state) {
+  foreach (element_children($form) as $key) {
+    $form[$key]['#tree'] = TRUE;
+    if (isset($form[$key]['#required'])) {
+      $form[$key]['#required'] = FALSE;
+    }
+    if (isset($form[$key]['#description'])) {
+      unset($form[$key]['#description']);
+    }
+    if (isset($form[$key]['#title'])) {
+      $form[$key]['#attributes']['placeholder'] = $form[$key]['#title'];
+      unset($form[$key]['#title']);
+    }
+
+    $form[$key] = inline_login_clean_up_form($form[$key], $form_state);
+  }
+
+  return $form;
+}
+
+/**
+ * Validation routine for inline login form.
+ */
+function inline_login_validate($form, &$form_state) {
+  $orig_form_state = $form_state;
+  if ($form_state['values']['login_or_register'] === 1) {
+    // Validate registration.
+    $form_state['input'] = drupal_array_merge_deep($form_state['input']['register'], $form_state['input']['register']['account']);
+    $form_state['values'] = drupal_array_merge_deep($form_state['values']['register'], $form_state['values']['register']['account']);
+    unset($form_state['input']['account'], $form_state['values']['account']);
+
+    // If we integrated with email_registration, name won't be there.
+    if (module_exists('email_registration') && !isset($form_state['input']['name'])) {
+      $form_state['values']['name'] = $form_state['values']['mail'];
+    }
+
+    if ($error = user_validate_mail($form_state['values']['mail'])) {
+      form_error($form['contacts']['register']['account']['mail'], $error);
+    }
+    else {
+      unset($form_state['uid']);
+      if (module_exists('logintoboggan')) {
+        logintoboggan_user_register_validate($form['contacts']['register'], $form_state);
+      }
+      else {
+        // Validate using user module's validation routine.
+        user_account_form_validate($form['contacts']['register'], $form_state);
+      }
+    }
+    $orig_form_state['input']['register'] = $form_state['input'];
+    $orig_form_state['values']['register'] = $form_state['values'];
+  }
+  else {
+    // Validate login.
+    $form_state['input'] = $form_state['input']['login'];
+    $form_state['values'] = $form_state['values']['login'];
+
+    if (empty($form_state['values']['name']) || empty($form_state['values']['pass'])) {
+      if (empty($form_state['values']['name'])) {
+        form_error($form['contacts']['login']['name'], t('!name field is required.', array('!name' => $form['contacts']['login']['name']['#attributes']['placeholder'])));
+      }
+      if (empty($form_state['values']['pass'])) {
+        form_error($form['contacts']['login']['pass'], t('!name field is required.', array('!name' => $form['contacts']['login']['pass']['#attributes']['placeholder'])));
+      }
+    }
+    else {
+      if (module_exists('email_registration')) {
+        $form_state['values']['mail'] = $form_state['values']['name'];
+        if ($name = db_query('SELECT name FROM {users} WHERE LOWER(mail) = LOWER(:name)', array(':name' => $form_state['values']['name']))->fetchField()) {
+          $form_state['values']['name'] = $name;
+        }
+      }
+      user_login_name_validate($form['contacts']['login'], $form_state);
+      user_login_authenticate_validate($form['contacts']['login'], $form_state);
+      user_login_final_validate($form['contacts']['login'], $form_state);
+    }
+    $orig_form_state['input']['login'] = $form_state['input'];
+    $orig_form_state['values']['login'] = $form_state['values'];
+  }
+
+  // Set back original form state.
+  $form_state['input'] = $orig_form_state['input'];
+  $form_state['values'] = $orig_form_state['values'];
+}
+
+/**
+ * Submit routine for inline login form.
+ */
+function inline_login_submit($form, &$form_state) {
+  global $user;
+  $orig_form_state = $form_state;
+  if ($form_state['values']['login_or_register'] === 1) {
+    // Process register.
+    $form_state['input'] = $form_state['input']['register'];
+    $form_state['values'] = $form_state['values']['register'];
+    unset($form_state['input']['account'], $form_state['values']['account']);
+
+    if (variable_get('user_email_verification', TRUE)) {
+      $status_save = 1;
+    }
+    elseif (variable_get('user_register', '') == 1) {
+      $status_save = 1;
+    }
+    else {
+      $status_save = $form_state['values']['status'];
+    }
+    $form_state['values']['status'] = $status_save;
+
+    unset($form_state['values']['uid']);
+
+    if (module_exists('logintoboggan')) {
+      logintoboggan_user_register_submit($form['contacts']['register'], $form_state);
+    }
+    else {
+      user_register_submit($form['contacts']['register'], $form_state);
+    }
+
+    $orig_form_state['values']['name'] = $form_state['user']->name;
+    $orig_form_state['values']['uid'] = $form_state['user']->uid;
+    $orig_form_state['values']['status'] = $status_save;
+
+  }
+  else {
+    // Process login.
+    $form_state['input'] = $form_state['input']['login'];
+    $form_state['values'] = $form_state['values']['login'];
+    user_login_submit($form['contacts']['login'], $form_state);
+
+    $orig_form_state['values']['name'] = $user->name;
+    $orig_form_state['values']['uid'] = $user->uid;
+  }
+
+  // Set back original form state.
+  $form_state['input'] = $orig_form_state['input'];
+  $form_state['values'] = $orig_form_state['values'];
+}
+
+/**
+ * Implements hook_library_alter().
+ */
+function inline_login_library_alter(&$libraries, $module) {
+  // Add custom states script.
+  if ($module == 'system' && isset($libraries['drupal.states'])) {
+    $path = drupal_get_path('module', 'inline_login') . '/js/title_state.js';
+    $libraries['drupal.states']['js'][$path] = array('group' => JS_LIBRARY, 'weight' => 1);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function inline_login_theme($existing, $type, $theme, $path) {
+  return array(
+    'form_element_login_register_action' => array(
+      'render element' => 'element',
+      'base hook' => 'form_element',
+    ),
+  );
+}
+
+/**
+ * Returns HTML for a login/register checkbox.
+ *
+ * @param $variables
+ * @return string
+ */
+function theme_form_element_login_register_action($variables) {
+  $element = &$variables['element'];
+
+  // This function is invoked as theme wrapper, but the rendered form element
+  // may not necessarily have been processed by form_builder().
+  $element += array(
+    '#title_display' => 'before',
+  );
+
+  // Add element #id for #type 'item'.
+  if (isset($element['#markup']) && !empty($element['#id'])) {
+    $attributes['id'] = $element['#id'];
+  }
+  // Add element's #type and #name as class to aid with JS/CSS selectors.
+  $attributes['class'] = array('form-item');
+  if (!empty($element['#type'])) {
+    $attributes['class'][] = 'form-type-' . strtr($element['#type'], '_', '-');
+  }
+  if (!empty($element['#name'])) {
+    $attributes['class'][] = 'form-item-' . strtr($element['#name'], array(
+        ' ' => '-',
+        '_' => '-',
+        '[' => '-',
+        ']' => ''
+      ));
+  }
+  // Add a class for disabled elements to facilitate cross-browser styling.
+  if (!empty($element['#attributes']['disabled'])) {
+    $attributes['class'][] = 'form-disabled';
+  }
+  $output = '<div' . drupal_attributes($attributes) . '>' . "\n";
+
+  if (!empty($element['#description'])) {
+    $output .= '<em class="label-description">' . $element['#description'] . "</em>\n";
+  }
+
+  // If #title is not set, we don't display any label or required marker.
+  if (!isset($element['#title'])) {
+    $element['#title_display'] = 'none';
+  }
+  $prefix = isset($element['#field_prefix']) ? '<span class="field-prefix">' . $element['#field_prefix'] . '</span> ' : '';
+  $suffix = isset($element['#field_suffix']) ? ' <span class="field-suffix">' . $element['#field_suffix'] . '</span>' : '';
+
+  switch ($element['#title_display']) {
+    case 'before':
+    case 'invisible':
+      $output .= ' ' . theme('form_element_label', $variables);
+      $output .= ' ' . $prefix . $element['#children'] . $suffix . "\n";
+      break;
+
+    case 'after':
+      $output .= ' ' . $prefix . $element['#children'] . $suffix;
+      $output .= ' ' . theme('form_element_label', $variables) . "\n";
+      break;
+
+    case 'none':
+    case 'attribute':
+      // Output no label and no required marker, only the children.
+      $output .= ' ' . $prefix . $element['#children'] . $suffix . "\n";
+      break;
+  }
+
+  $output .= "</div>\n";
+
+  return $output;
+}

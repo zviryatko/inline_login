@@ -1,0 +1,4 @@
+name = Inline login
+description = Provide inline login form on startup add page
+core = 7.x
+package = TechGarden
